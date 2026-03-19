@@ -287,7 +287,9 @@ pub async fn get_folders(
 
     // 筛选出前缀为 file_meta_ 的表名
     for table_name in table_names {
-        if let Some(folder_name) = table_name.strip_prefix("file_meta_") {
+        if let Some(enc_folder) = table_name.strip_prefix("file_meta_") {
+            let folder_name = crate::upload::decode_folder_name(enc_folder);
+            
             let table = state.db.open_table(&table_name).execute().await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -302,7 +304,7 @@ pub async fn get_folders(
             let file_count = table.count_rows(None).await.unwrap_or(0);
             
             folders.push(FolderInfo {
-                name: folder_name.to_string(),
+                name: folder_name,
                 file_count,
             });
         }

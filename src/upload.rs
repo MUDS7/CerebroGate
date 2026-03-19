@@ -102,6 +102,52 @@ async fn ensure_table(
     Ok(())
 }
 
+/// 初始化默认文件夹
+pub async fn init_default_folders(db: &lancedb::Connection) -> Result<(), Box<dyn std::error::Error>> {
+    let default_folders = ["项目文件", "其他文件"];
+    let table_names = db.table_names().execute().await?;
+
+    for folder in default_folders {
+        let enc_folder = encode_folder_name(folder);
+        let chunks_table_name = format!("files_{}", enc_folder);
+        let meta_table_name = format!("file_meta_{}", enc_folder);
+
+        if !table_names.contains(&chunks_table_name) {
+            let batches = RecordBatchIterator::new(vec![], make_chunks_schema());
+            db.create_table(&chunks_table_name, Box::new(batches)).execute().await?;
+            info!("基础表 '{}' 创建成功", chunks_table_name);
+        }
+
+        if !table_names.contains(&meta_table_name) {
+            let batches = RecordBatchIterator::new(vec![], make_meta_schema());
+            db.create_table(&meta_table_name, Box::new(batches)).execute().await?;
+            info!("基础表 '{}' 创建成功", meta_table_name);
+        }
+    }
+
+    Ok(())
+}
+
+/// 文件夹名称编码（转为十六进制以符合 LanceDB 表名只允许字母数字下划线的限制）
+pub fn encode_folder_name(folder: &str) -> String {
+    folder.bytes().map(|b| format!("{:02x}", b)).collect::<String>()
+}
+
+/// 文件夹名称解码
+pub fn decode_folder_name(encoded: &str) -> String {
+    let bytes: Vec<u8> = (0..encoded.len())
+        .step_by(2)
+        .filter_map(|i| {
+            if i + 2 <= encoded.len() {
+                u8::from_str_radix(&encoded[i..i + 2], 16).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    String::from_utf8(bytes).unwrap_or_else(|_| encoded.to_string())
+}
+
 /// 获取文件扩展名（小写）
 fn get_extension(file_name: &str) -> String {
     Path::new(file_name)
@@ -266,8 +312,9 @@ pub async fn upload_file(
     info!("文件已保存: {}", file_path);
 
     // === 2. 构建表名 ===
-    let chunks_table_name = format!("files_{}", folder);
-    let meta_table_name = format!("file_meta_{}", folder);
+    let enc_folder = encode_folder_name(&folder);
+    let chunks_table_name = format!("files_{}", enc_folder);
+    let meta_table_name = format!("file_meta_{}", enc_folder);
 
     // 确保表存在
     ensure_table(&state.db, &chunks_table_name, make_chunks_schema()).await?;

@@ -1,0 +1,138 @@
+﻿diff --git a/.gitignore b/.gitignore
+index ea8c4bf..a727c0a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,2 @@
+ /target
++/data
+diff --git a/src/handler.rs b/src/handler.rs
+index a377920..5a0f95d 100644
+--- a/src/handler.rs
++++ b/src/handler.rs
+@@ -287,7 +287,9 @@ pub async fn get_folders(
+ 
+     // 绛涢€夊嚭鍓嶇紑涓?file_meta_ 鐨勮〃鍚?     for table_name in table_names {
+-        if let Some(folder_name) = table_name.strip_prefix("file_meta_") {
++        if let Some(enc_folder) = table_name.strip_prefix("file_meta_") {
++            let folder_name = crate::upload::decode_folder_name(enc_folder);
++            
+             let table = state.db.open_table(&table_name).execute().await.map_err(|e| {
+                 (
+                     StatusCode::INTERNAL_SERVER_ERROR,
+@@ -302,7 +304,7 @@ pub async fn get_folders(
+             let file_count = table.count_rows(None).await.unwrap_or(0);
+             
+             folders.push(FolderInfo {
+-                name: folder_name.to_string(),
++                name: folder_name,
+                 file_count,
+             });
+         }
+diff --git a/src/main.rs b/src/main.rs
+index a98b9c5..8beaf08 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -15,20 +15,25 @@ use tower_http::cors::CorsLayer;
+ use tracing::info;
+ 
+ use handler::{AppState, add_item, get_folders, health_check, init_table, search};
+-use upload::upload_file;
++use upload::{init_default_folders, upload_file};
+ 
+ #[tokio::main]
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     // 鍒濆鍖栨棩蹇?     tracing_subscriber::fmt::init();
+ 
+-    // 杩炴帴 LanceDB锛堜娇鐢ㄦ湰鍦扮洰褰曞瓨鍌級
+-    let db = connect("data/cerebro_gate.lancedb").execute().await?;
+-    info!("LanceDB 鏁版嵁搴撹繛鎺ユ垚鍔?);
++    let db_path = "./.lancedb".to_string();
++
++    // 杩炴帴 LanceDB
++    let db = connect(&db_path).execute().await?;
++    info!("LanceDB 鏁版嵁搴撹繛鎺ユ垚鍔?({})", db_path);
+ 
+     // 鍒濆鍖栬〃锛堝鏋滀笉瀛樺湪鍒欏垱寤猴級
+     init_table(&db).await?;
+ 
++    // 鍒濆鍖栭粯璁ゆ枃浠跺す锛堥」鐩枃浠躲€佸叾浠栨枃浠讹級
++    init_default_folders(&db).await?;
++
+     let state = Arc::new(AppState { db });
+ 
+     // 鏋勫缓璺敱
+@@ -42,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+         .with_state(state);
+ 
+     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+-    info!("鏈嶅姟鍣ㄥ惎鍔ㄥ湪 http://0.0.0.0:3000");
++    info!("鏈嶅姟鍣ㄥ惎鍔ㄥ湪 http://127.0.0.1:3000 (鐩戝惉鎵€鏈夋帴鍙?0.0.0.0:3000)");
+ 
+     axum::serve(listener, app).await?;
+ 
+diff --git a/src/upload.rs b/src/upload.rs
+index dd01001..8fff17f 100644
+--- a/src/upload.rs
++++ b/src/upload.rs
+@@ -102,6 +102,52 @@ async fn ensure_table(
+     Ok(())
+ }
+ 
++/// 鍒濆鍖栭粯璁ゆ枃浠跺す
++pub async fn init_default_folders(db: &lancedb::Connection) -> Result<(), Box<dyn std::error::Error>> {
++    let default_folders = ["椤圭洰鏂囦欢", "鍏朵粬鏂囦欢"];
++    let table_names = db.table_names().execute().await?;
++
++    for folder in default_folders {
++        let enc_folder = encode_folder_name(folder);
++        let chunks_table_name = format!("files_{}", enc_folder);
++        let meta_table_name = format!("file_meta_{}", enc_folder);
++
++        if !table_names.contains(&chunks_table_name) {
++            let batches = RecordBatchIterator::new(vec![], make_chunks_schema());
++            db.create_table(&chunks_table_name, Box::new(batches)).execute().await?;
++            info!("鍩虹琛?'{}' 鍒涘缓鎴愬姛", chunks_table_name);
++        }
++
++        if !table_names.contains(&meta_table_name) {
++            let batches = RecordBatchIterator::new(vec![], make_meta_schema());
++            db.create_table(&meta_table_name, Box::new(batches)).execute().await?;
++            info!("鍩虹琛?'{}' 鍒涘缓鎴愬姛", meta_table_name);
++        }
++    }
++
++    Ok(())
++}
++
++/// 鏂囦欢澶瑰悕绉扮紪鐮侊紙杞负鍗佸叚杩涘埗浠ョ鍚?LanceDB 琛ㄥ悕鍙厑璁稿瓧姣嶆暟瀛椾笅鍒掔嚎鐨勯檺鍒讹級
++pub fn encode_folder_name(folder: &str) -> String {
++    folder.bytes().map(|b| format!("{:02x}", b)).collect::<String>()
++}
++
++/// 鏂囦欢澶瑰悕绉拌В鐮?+pub fn decode_folder_name(encoded: &str) -> String {
++    let bytes: Vec<u8> = (0..encoded.len())
++        .step_by(2)
++        .filter_map(|i| {
++            if i + 2 <= encoded.len() {
++                u8::from_str_radix(&encoded[i..i + 2], 16).ok()
++            } else {
++                None
++            }
++        })
++        .collect();
++    String::from_utf8(bytes).unwrap_or_else(|_| encoded.to_string())
++}
++
+ /// 鑾峰彇鏂囦欢鎵╁睍鍚嶏紙灏忓啓锛? fn get_extension(file_name: &str) -> String {
+     Path::new(file_name)
+@@ -266,8 +312,9 @@ pub async fn upload_file(
+     info!("鏂囦欢宸蹭繚瀛? {}", file_path);
+ 
+     // === 2. 鏋勫缓琛ㄥ悕 ===
+-    let chunks_table_name = format!("files_{}", folder);
+-    let meta_table_name = format!("file_meta_{}", folder);
++    let enc_folder = encode_folder_name(&folder);
++    let chunks_table_name = format!("files_{}", enc_folder);
++    let meta_table_name = format!("file_meta_{}", enc_folder);
+ 
+     // 纭繚琛ㄥ瓨鍦?     ensure_table(&state.db, &chunks_table_name, make_chunks_schema()).await?;
