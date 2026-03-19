@@ -1,0 +1,18 @@
+[package]
+name = "cerebro_gate"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lancedb = "0.15"
+arrow-array = "53"
+arrow-schema = "53"
+arrow-data = "53"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures = "0.3"
