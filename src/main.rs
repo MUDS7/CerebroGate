@@ -1,4 +1,8 @@
 mod handler;
+mod extractor;
+mod chunker;
+mod embedding;
+mod upload;
 
 use std::sync::Arc;
 
@@ -11,6 +15,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use handler::{AppState, add_item, health_check, init_table, search};
+use upload::upload_file;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", get(health_check))
         .route("/api/items", post(add_item))
         .route("/api/search", post(search))
+        .route("/api/upload", post(upload_file))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
