@@ -4,11 +4,10 @@ use std::sync::Arc;
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use axum::{
+    Json,
     extract::{Multipart, State},
     http::StatusCode,
-    Json,
 };
-use lancedb::query::ExecutableQuery;
 use serde::Serialize;
 use tracing::info;
 use uuid::Uuid;
@@ -252,15 +251,17 @@ pub async fn upload_file(
     })?;
 
     let file_path = format!("{}/{}", upload_dir, file_name);
-    tokio::fs::write(&file_path, &file_data).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse {
-                success: false,
-                message: format!("保存文件失败: {}", e),
-            }),
-        )
-    })?;
+    tokio::fs::write(&file_path, &file_data)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse {
+                    success: false,
+                    message: format!("保存文件失败: {}", e),
+                }),
+            )
+        })?;
 
     info!("文件已保存: {}", file_path);
 
@@ -281,8 +282,8 @@ pub async fn upload_file(
         info!("图片文件 '{}' 仅保存，跳过文本处理", file_name);
     } else {
         // 文档文件：提取 → 切片 → 向量化 → 存储
-        let extracted: Vec<ExtractedText> =
-            extractor::extract_text(&file_path, &extension).map_err(|e| {
+        let extracted: Vec<ExtractedText> = extractor::extract_text(&file_path, &extension)
+            .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiResponse {
@@ -380,40 +381,26 @@ async fn store_chunks(
 ) -> Result<(), (StatusCode, Json<ApiResponse>)> {
     let schema = make_chunks_schema();
 
-    let table = db
-        .open_table(table_name)
-        .execute()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse {
-                    success: false,
-                    message: format!("打开切片表失败: {}", e),
-                }),
-            )
-        })?;
+    let table = db.open_table(table_name).execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("打开切片表失败: {}", e),
+            }),
+        )
+    })?;
 
     // 构建各列数据
-    let ids: Vec<String> = chunks
-        .iter()
-        .map(|_| Uuid::new_v4().to_string())
-        .collect();
+    let ids: Vec<String> = chunks.iter().map(|_| Uuid::new_v4().to_string()).collect();
     let id_array = StringArray::from(ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     let file_id_array = StringArray::from(vec![file_id; chunks.len()]);
-    let text_array = StringArray::from(
-        chunks
-            .iter()
-            .map(|c| c.text.as_str())
-            .collect::<Vec<_>>(),
-    );
+    let text_array = StringArray::from(chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>());
     let file_path_array = StringArray::from(vec![file_path; chunks.len()]);
-    let page_number_array = Int32Array::from(
-        chunks.iter().map(|c| c.page_number).collect::<Vec<_>>(),
-    );
-    let chunk_index_array = Int32Array::from(
-        chunks.iter().map(|c| c.chunk_index).collect::<Vec<_>>(),
-    );
+    let page_number_array =
+        Int32Array::from(chunks.iter().map(|c| c.page_number).collect::<Vec<_>>());
+    let chunk_index_array =
+        Int32Array::from(chunks.iter().map(|c| c.chunk_index).collect::<Vec<_>>());
 
     // 构建向量列 (FixedSizeList)
     let all_values: Vec<f32> = embeddings.iter().flatten().copied().collect();
@@ -458,19 +445,15 @@ async fn store_chunks(
     })?;
 
     let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-    table
-        .add(Box::new(batches))
-        .execute()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse {
-                    success: false,
-                    message: format!("写入切片数据失败: {}", e),
-                }),
-            )
-        })?;
+    table.add(Box::new(batches)).execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("写入切片数据失败: {}", e),
+            }),
+        )
+    })?;
 
     Ok(())
 }
@@ -490,19 +473,15 @@ async fn store_metadata(
 ) -> Result<(), (StatusCode, Json<ApiResponse>)> {
     let schema = make_meta_schema();
 
-    let table = db
-        .open_table(table_name)
-        .execute()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse {
-                    success: false,
-                    message: format!("打开元数据表失败: {}", e),
-                }),
-            )
-        })?;
+    let table = db.open_table(table_name).execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("打开元数据表失败: {}", e),
+            }),
+        )
+    })?;
 
     let file_id_array = StringArray::from(vec![file_id]);
     let file_name_array = StringArray::from(vec![file_name]);
@@ -535,19 +514,15 @@ async fn store_metadata(
     })?;
 
     let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-    table
-        .add(Box::new(batches))
-        .execute()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse {
-                    success: false,
-                    message: format!("写入元数据失败: {}", e),
-                }),
-            )
-        })?;
+    table.add(Box::new(batches)).execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("写入元数据失败: {}", e),
+            }),
+        )
+    })?;
 
     Ok(())
 }

@@ -262,5 +262,51 @@ pub async fn search(
     Ok(Json(search_results))
 }
 
+/// 文件夹信息响应
+#[derive(Debug, Serialize)]
+pub struct FolderInfo {
+    pub name: String,
+    pub file_count: usize,
+}
 
+/// 获取所有的 LanceDB 文件夹及对应文件数量
+pub async fn get_folders(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<FolderInfo>>, (StatusCode, Json<ApiResponse>)> {
+    let table_names = state.db.table_names().execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("获取表列表失败: {}", e),
+            }),
+        )
+    })?;
 
+    let mut folders = Vec::new();
+
+    // 筛选出前缀为 file_meta_ 的表名
+    for table_name in table_names {
+        if let Some(folder_name) = table_name.strip_prefix("file_meta_") {
+            let table = state.db.open_table(&table_name).execute().await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse {
+                        success: false,
+                        message: format!("打开表 {} 失败: {}", table_name, e),
+                    }),
+                )
+            })?;
+            
+            // 查出该表的行数，从而得到文件的数量
+            let file_count = table.count_rows(None).await.unwrap_or(0);
+            
+            folders.push(FolderInfo {
+                name: folder_name.to_string(),
+                file_count,
+            });
+        }
+    }
+
+    Ok(Json(folders))
+}
