@@ -20,7 +20,7 @@ use handler::{
     health_check, init_table, rename_folder, search,
 };
 use upload::{init_default_folders, upload_file};
-use chat::{chat, get_sessions, get_session_detail, delete_session};
+use chat::{chat, chat_rag, get_sessions, get_session_detail, delete_session};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/folders/files", post(get_folder_files))
         .route("/api/folders/files/content", post(get_file_content))
         .route("/api/chat", post(chat))
+        .route("/api/chat/rag", post(chat_rag))
         .route("/api/chat/sessions", get(get_sessions))
         .route("/api/chat/session", post(get_session_detail))
         .route("/api/chat/session/delete", post(delete_session))

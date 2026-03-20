@@ -1,10 +1,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow_array::StringArray;
 use axum::{Json, extract::{Multipart, State}, http::StatusCode};
+use futures::TryStreamExt;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::embedding;
 use crate::extractor;
 use crate::handler::{ApiResponse, AppState};
 
@@ -313,11 +317,6 @@ pub async fn chat(
     })? {
         let name = field.name().unwrap_or("").to_string();
         let field_file_name = field.file_name().map(|s| s.to_string());
-        let field_content_type = field.content_type().map(|s| s.to_string());
-        info!(
-            "[multipart] 收到字段: name='{}', file_name={:?}, content_type={:?}",
-            name, field_file_name, field_content_type
-        );
 
         match name.as_str() {
             "message" => {
@@ -746,5 +745,388 @@ pub async fn delete_session(
     Ok(Json(ApiResponse {
         success: true,
         message: format!("会话 {} 已删除", session_id),
+    }))
+}
+
+// ──────────────────────────────────────
+// RAG 对话（优先检索本地向量库）
+// ──────────────────────────────────────
+
+/// RAG 对话请求体
+#[derive(Debug, Deserialize)]
+pub struct RagChatRequest {
+    /// 用户输入的消息
+    pub message: String,
+    /// 历史对话记录（可选）
+    #[serde(default)]
+    pub history: Vec<ChatMessage>,
+    /// 使用的模型，默认 deepseek-chat
+    #[serde(default = "rag_default_model")]
+    pub model: String,
+    /// 是否开启思考模式
+    #[serde(default)]
+    pub thinking: Option<bool>,
+    /// 会话 ID（可选）
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// 向量搜索返回的最大结果数，默认 5
+    #[serde(default = "rag_default_top_k")]
+    pub top_k: usize,
+}
+
+fn rag_default_model() -> String {
+    "deepseek-chat".to_string()
+}
+
+fn rag_default_top_k() -> usize {
+    5
+}
+
+/// 向量搜索命中的片段
+#[derive(Debug)]
+struct RagHit {
+    text: String,
+    file_path: String,
+    distance: f32,
+}
+
+/// POST /api/chat/rag
+///
+/// 优先检索本地向量库（所有已上传文档），将相关内容作为上下文发给大模型
+pub async fn chat_rag(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RagChatRequest>,
+) -> Result<Json<ChatResponse>, (StatusCode, Json<ApiResponse>)> {
+    let api_key = std::env::var("DEEPSEEK_API_KEY").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: "未设置 DEEPSEEK_API_KEY 环境变量".to_string(),
+            }),
+        )
+    })?;
+
+    let user_message = payload.message.clone();
+    info!("[RAG] 收到用户问题: {}", user_message.chars().take(100).collect::<String>());
+
+    // ── 1. 将用户问题本地向量化 ──────────────────────
+    let query_texts = vec![user_message.clone()];
+    let query_vectors = embedding::embed_texts(&query_texts, &api_key)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse {
+                    success: false,
+                    message: format!("用户问题向量化失败: {}", e),
+                }),
+            )
+        })?;
+
+    let query_vector = query_vectors.into_iter().next().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: "向量化结果为空".to_string(),
+            }),
+        )
+    })?;
+
+    info!("[RAG] 用户问题向量化完成，维度: {}", query_vector.len());
+
+    // ── 2. 遍历所有 files_* 表进行向量搜索 ──────────────
+    let table_names = state.db.table_names().execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("获取表列表失败: {}", e),
+            }),
+        )
+    })?;
+
+    let files_tables: Vec<&String> = table_names
+        .iter()
+        .filter(|n| n.starts_with("files_"))
+        .collect();
+
+    info!("[RAG] 检索 {} 个文档表: {:?}", files_tables.len(), files_tables);
+
+    let mut all_hits: Vec<RagHit> = Vec::new();
+
+    for table_name in &files_tables {
+        let table = match state.db.open_table(table_name.as_str()).execute().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("[RAG] 打开表 '{}' 失败: {}", table_name, e);
+                continue;
+            }
+        };
+
+        // 检查表是否有数据
+        let row_count = table.count_rows(None).await.unwrap_or(0);
+        if row_count == 0 {
+            continue;
+        }
+
+        let results = match table
+            .vector_search(query_vector.clone())
+            .map_err(|e| format!("{}", e))
+        {
+            Ok(query) => match query.limit(payload.top_k).execute().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!("[RAG] 表 '{}' 向量搜索执行失败: {}", table_name, e);
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!("[RAG] 表 '{}' 创建搜索查询失败: {}", table_name, e);
+                continue;
+            }
+        };
+
+        let batches: Vec<arrow_array::RecordBatch> = match results.try_collect().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("[RAG] 表 '{}' 收集搜索结果失败: {}", table_name, e);
+                continue;
+            }
+        };
+
+        for batch in &batches {
+            let text_col = batch
+                .column_by_name("text")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let path_col = batch
+                .column_by_name("file_path")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let dist_col = batch
+                .column_by_name("_distance")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>());
+
+            if let (Some(texts), Some(paths), Some(dists)) = (text_col, path_col, dist_col) {
+                for i in 0..batch.num_rows() {
+                    all_hits.push(RagHit {
+                        text: texts.value(i).to_string(),
+                        file_path: paths.value(i).to_string(),
+                        distance: dists.value(i),
+                    });
+                }
+            }
+        }
+    }
+
+    // 按距离排序，取 top_k
+    all_hits.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+    all_hits.truncate(payload.top_k);
+
+    // ── 3. 打印检索结果日志 ──────────────────────
+    if all_hits.is_empty() {
+        info!("[RAG] ❌ 本地向量库未检索到相关内容，将直接提问大模型");
+    } else {
+        info!("[RAG] ✅ 本地向量库命中 {} 条相关内容:", all_hits.len());
+        for (i, hit) in all_hits.iter().enumerate() {
+            info!(
+                "[RAG]   #{}: 距离={:.4}, 来源='{}', 内容前80字: {}",
+                i + 1,
+                hit.distance,
+                hit.file_path,
+                hit.text.chars().take(80).collect::<String>()
+            );
+        }
+    }
+
+    // ── 4. 构建发送给大模型的消息 ──────────────────────
+    let final_message = if all_hits.is_empty() {
+        user_message.clone()
+    } else {
+        let mut context_parts = Vec::new();
+        for hit in &all_hits {
+            context_parts.push(format!(
+                "【来源: {}】\n{}",
+                hit.file_path, hit.text
+            ));
+        }
+        let rag_context = context_parts.join("\n\n");
+        format!(
+            "以下是从知识库中检索到的与用户问题相关的参考内容：\n\n{}\n\n请结合以上参考内容回答用户的问题。如果参考内容与问题无关，请忽略参考内容直接回答。\n\n用户问题：{}",
+            rag_context, user_message
+        )
+    };
+
+    // ── 5. 组装消息列表 ──────────────────────
+    let mut messages = payload.history.clone();
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: final_message,
+    });
+
+    let thinking = match payload.thinking {
+        Some(true) => Some(ThinkingParam { kind: "enabled".to_string() }),
+        Some(false) => Some(ThinkingParam { kind: "disabled".to_string() }),
+        None => None,
+    };
+
+    let body = DeepSeekRequest {
+        model: payload.model.clone(),
+        messages,
+        thinking,
+    };
+
+    info!(
+        "[RAG] 调用 DeepSeek (model={})，消息数: {}，本地命中: {} 条",
+        payload.model,
+        body.messages.len(),
+        all_hits.len()
+    );
+
+    // ── 6. 调用 DeepSeek API ──────────────────────
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.deepseek.com/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiResponse {
+                    success: false,
+                    message: format!("请求 DeepSeek API 失败: {}", e),
+                }),
+            )
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let error_text = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiResponse {
+                success: false,
+                message: format!("DeepSeek API 返回错误 ({}): {}", status, error_text),
+            }),
+        ));
+    }
+
+    let ds_resp: DeepSeekResponse = resp.json().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("解析 DeepSeek 响应失败: {}", e),
+            }),
+        )
+    })?;
+
+    let first_choice = ds_resp.choices.first();
+    let reply = first_choice
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+    let reasoning_content = first_choice
+        .and_then(|c| c.message.reasoning_content.clone())
+        .filter(|s| !s.is_empty());
+    let usage = ds_resp.usage.map(|u| UsageInfo {
+        prompt_tokens: u.prompt_tokens,
+        completion_tokens: u.completion_tokens,
+        total_tokens: u.total_tokens,
+    });
+
+    info!("[RAG] DeepSeek 回复长度: {} 字符", reply.len());
+
+    // ── 7. 保存会话记录 ──────────────────────
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let is_new_session = payload.session_id.is_none();
+
+    let session_id = payload
+        .session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let mut record = if is_new_session {
+        SessionRecord {
+            session_id: session_id.clone(),
+            title: "新对话".to_string(),
+            model: payload.model.clone(),
+            messages: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        }
+    } else {
+        load_session(&session_id).await.unwrap_or_else(|| SessionRecord {
+            session_id: session_id.clone(),
+            title: "新对话".to_string(),
+            model: payload.model.clone(),
+            messages: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+    };
+
+    record.messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: user_message.clone(),
+    });
+    record.messages.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: reply.clone(),
+    });
+    record.updated_at = now.clone();
+
+    if let Err(e) = save_session(&record).await {
+        warn!("保存会话记录失败: {}", e);
+    }
+
+    let mut sessions = load_sessions_index().await;
+    if let Some(meta) = sessions.iter_mut().find(|s| s.session_id == session_id) {
+        meta.message_count = record.messages.len();
+        meta.updated_at = now.clone();
+    } else {
+        sessions.push(SessionMeta {
+            session_id: session_id.clone(),
+            title: "新对话".to_string(),
+            model: payload.model.clone(),
+            message_count: record.messages.len(),
+            created_at: now.clone(),
+            updated_at: now,
+        });
+    }
+    if let Err(e) = save_sessions_index(&sessions).await {
+        warn!("保存会话索引失败: {}", e);
+    }
+
+    if is_new_session {
+        let sid = session_id.clone();
+        let user_msg = user_message.clone();
+        let assistant_reply = reply.clone();
+        tokio::spawn(async move {
+            let title = summarize_title(&user_msg, &assistant_reply).await;
+            info!("会话 {} 标题总结: {}", sid, title);
+            if let Some(mut rec) = load_session(&sid).await {
+                rec.title = title.clone();
+                if let Err(e) = save_session(&rec).await {
+                    warn!("更新会话标题失败: {}", e);
+                }
+            }
+            let mut sessions = load_sessions_index().await;
+            if let Some(meta) = sessions.iter_mut().find(|s| s.session_id == sid) {
+                meta.title = title;
+            }
+            if let Err(e) = save_sessions_index(&sessions).await {
+                warn!("更新索引标题失败: {}", e);
+            }
+        });
+    }
+
+    Ok(Json(ChatResponse {
+        success: true,
+        reply,
+        reasoning_content,
+        usage,
+        session_id,
     }))
 }
