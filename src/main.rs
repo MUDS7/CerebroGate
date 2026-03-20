@@ -3,6 +3,7 @@ mod extractor;
 mod chunker;
 mod embedding;
 mod upload;
+mod chat;
 
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use handler::{
     health_check, init_table, rename_folder, search,
 };
 use upload::{init_default_folders, upload_file};
+use chat::chat;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -53,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/folders/delete", post(delete_folder))
         .route("/api/folders/files", post(get_folder_files))
         .route("/api/folders/files/content", post(get_file_content))
+        .route("/api/chat", post(chat))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
