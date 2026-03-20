@@ -6,7 +6,7 @@ use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, St
 use arrow_schema::{DataType, Field, Schema};
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::State,
     http::StatusCode,
 };
 use lancedb::{Connection, query::{ExecutableQuery, QueryBase}};
@@ -469,9 +469,9 @@ pub async fn rename_folder(
     }))
 }
 
-/// 查询文件夹文件列表请求参数
+/// 查询文件夹文件列表请求体
 #[derive(Debug, Deserialize)]
-pub struct GetFolderFilesQuery {
+pub struct GetFolderFilesRequest {
     pub folder: String,
 }
 
@@ -490,12 +490,9 @@ pub struct FileInfo {
 /// 查询指定文件夹下的所有文件
 pub async fn get_folder_files(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<GetFolderFilesQuery>,
+    Json(payload): Json<GetFolderFilesRequest>,
 ) -> Result<Json<Vec<FileInfo>>, (StatusCode, Json<ApiResponse>)> {
-    // URL 解码文件夹名，防止前端二次编码
-    let folder = urlencoding::decode(&params.folder)
-        .unwrap_or(std::borrow::Cow::Borrowed(&params.folder))
-        .to_string();
+    let folder = payload.folder;
 
     if folder.trim().is_empty() {
         return Err((
@@ -526,7 +523,7 @@ pub async fn get_folder_files(
             StatusCode::NOT_FOUND,
             Json(ApiResponse {
                 success: false,
-                message: format!("文件夹 '{}' 不存在", folder),
+                message: format!("文件夹 '{}' 不存在", &folder),
             }),
         ));
     }
@@ -623,4 +620,73 @@ pub async fn get_folder_files(
     }
 
     Ok(Json(files))
+}
+
+/// 查询文件内容请求体
+#[derive(Debug, Deserialize)]
+pub struct GetFileContentRequest {
+    pub folder: String,
+    pub file_name: String,
+}
+
+/// 文件内容响应
+#[derive(Debug, Serialize)]
+pub struct FileContentResponse {
+    pub success: bool,
+    pub file_name: String,
+    pub file_type: String,
+    pub file_size: u64,
+    pub content_base64: String,
+}
+
+/// 查询指定文件夹下某个文件的内容（base64）
+pub async fn get_file_content(
+    Json(payload): Json<GetFileContentRequest>,
+) -> Result<Json<FileContentResponse>, (StatusCode, Json<ApiResponse>)> {
+    let folder = payload.folder;
+    let file_name = payload.file_name;
+
+    if folder.trim().is_empty() || file_name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: "参数错误: folder 和 file_name 不能为空".to_string(),
+            }),
+        ));
+    }
+
+    let file_path = format!("data/uploads/{}/{}", folder, file_name);
+
+    // 读取文件
+    let data = tokio::fs::read(&file_path).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse {
+                success: false,
+                message: format!("读取文件失败: {}", e),
+            }),
+        )
+    })?;
+
+    let file_size = data.len() as u64;
+
+    // base64 编码
+    use base64::Engine;
+    let content_base64 = base64::engine::general_purpose::STANDARD.encode(&data);
+
+    // 获取文件扩展名
+    let file_type = std::path::Path::new(&file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    Ok(Json(FileContentResponse {
+        success: true,
+        file_name,
+        file_type,
+        file_size,
+        content_base64,
+    }))
 }

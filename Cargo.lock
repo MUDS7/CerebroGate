@@ -1215,6 +1215,7 @@ dependencies = [
  "arrow-data",
  "arrow-schema",
  "axum",
+ "base64 0.22.1",
  "calamine",
  "chrono",
  "csv",
