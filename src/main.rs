@@ -15,8 +15,8 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use handler::{
-    AppState, add_item, create_folder, delete_folder, get_folders, health_check, init_table,
-    rename_folder, search,
+    AppState, add_item, create_folder, delete_folder, get_folder_files, get_folders, health_check,
+    init_table, rename_folder, search,
 };
 use upload::{init_default_folders, upload_file};
 
@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/folders", get(get_folders).post(create_folder))
         .route("/api/folders/rename", post(rename_folder))
         .route("/api/folders/delete", post(delete_folder))
+        .route("/api/folders/files", get(get_folder_files))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

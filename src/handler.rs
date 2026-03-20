@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 
-use arrow_array::{Float32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use axum::{
     Json,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
 };
 use lancedb::{Connection, query::{ExecutableQuery, QueryBase}};
@@ -467,4 +467,160 @@ pub async fn rename_folder(
         success: true,
         message: format!("文件夹 '{}' 已重命名为 '{}'", old_name, new_name),
     }))
+}
+
+/// 查询文件夹文件列表请求参数
+#[derive(Debug, Deserialize)]
+pub struct GetFolderFilesQuery {
+    pub folder: String,
+}
+
+/// 文件信息响应
+#[derive(Debug, Serialize)]
+pub struct FileInfo {
+    pub file_id: String,
+    pub file_name: String,
+    pub file_type: String,
+    pub file_path: String,
+    pub file_size: i64,
+    pub chunk_count: i32,
+    pub created_at: String,
+}
+
+/// 查询指定文件夹下的所有文件
+pub async fn get_folder_files(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<GetFolderFilesQuery>,
+) -> Result<Json<Vec<FileInfo>>, (StatusCode, Json<ApiResponse>)> {
+    // URL 解码文件夹名，防止前端二次编码
+    let folder = urlencoding::decode(&params.folder)
+        .unwrap_or(std::borrow::Cow::Borrowed(&params.folder))
+        .to_string();
+
+    if folder.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: "参数错误: folder 不能为空".to_string(),
+            }),
+        ));
+    }
+
+    let enc_folder = crate::upload::encode_folder_name(&folder);
+    let meta_table_name = format!("file_meta_{}", enc_folder);
+
+    // 检查表是否存在
+    let table_names = state.db.table_names().execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("获取表列表失败: {}", e),
+            }),
+        )
+    })?;
+
+    if !table_names.contains(&meta_table_name) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse {
+                success: false,
+                message: format!("文件夹 '{}' 不存在", folder),
+            }),
+        ));
+    }
+
+    let table = state.db.open_table(&meta_table_name).execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("打开元数据表失败: {}", e),
+            }),
+        )
+    })?;
+
+    let batches: Vec<RecordBatch> = table
+        .query()
+        .execute()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse {
+                    success: false,
+                    message: format!("查询文件列表失败: {}", e),
+                }),
+            )
+        })?
+        .try_collect()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse {
+                    success: false,
+                    message: format!("收集查询结果失败: {}", e),
+                }),
+            )
+        })?;
+
+    let mut files = Vec::new();
+
+    for batch in &batches {
+        let file_id_col = batch
+            .column_by_name("file_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let file_name_col = batch
+            .column_by_name("file_name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let file_type_col = batch
+            .column_by_name("file_type")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let file_path_col = batch
+            .column_by_name("file_path")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let file_size_col = batch
+            .column_by_name("file_size")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::Int64Array>());
+        let chunk_count_col = batch
+            .column_by_name("chunk_count")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        let created_at_col = batch
+            .column_by_name("created_at")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+        if let (
+            Some(file_ids),
+            Some(file_names),
+            Some(file_types),
+            Some(file_paths),
+            Some(file_sizes),
+            Some(chunk_counts),
+            Some(created_ats),
+        ) = (
+            file_id_col,
+            file_name_col,
+            file_type_col,
+            file_path_col,
+            file_size_col,
+            chunk_count_col,
+            created_at_col,
+        ) {
+            for i in 0..batch.num_rows() {
+                files.push(FileInfo {
+                    file_id: file_ids.value(i).to_string(),
+                    file_name: file_names.value(i).to_string(),
+                    file_type: file_types.value(i).to_string(),
+                    file_path: file_paths.value(i).to_string(),
+                    file_size: file_sizes.value(i),
+                    chunk_count: chunk_counts.value(i),
+                    created_at: created_ats.value(i).to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(Json(files))
 }
