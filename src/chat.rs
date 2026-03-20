@@ -24,6 +24,9 @@ use crate::handler::{ApiResponse, AppState};
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// RAG 命中的引用信息（仅 assistant 消息在 RAG 模式下有值）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<Vec<ReferenceInfo>>,
 }
 
 /// 返回给前端的对话响应
@@ -40,6 +43,26 @@ pub struct ChatResponse {
     pub usage: Option<UsageInfo>,
     /// 会话 ID（新建或已有）
     pub session_id: String,
+    /// RAG 命中的文档引用信息（仅 /api/chat/rag 有值）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub references: Option<Vec<ReferenceInfo>>,
+}
+
+/// RAG 命中的文档引用信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceInfo {
+    /// 文件名
+    pub file_name: String,
+    /// 文件路径
+    pub file_path: String,
+    /// 页码
+    pub page_number: i32,
+    /// 切片序号
+    pub chunk_index: i32,
+    /// 向量距离（越小越相关）
+    pub distance: f32,
+    /// 命中的文本片段（前200字）
+    pub snippet: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +241,7 @@ async fn summarize_title(user_message: &str, assistant_reply: &str) -> String {
         messages: vec![ChatMessage {
             role: "user".to_string(),
             content: prompt,
+            references: None,
         }],
         thinking: None,
     };
@@ -501,6 +525,7 @@ pub async fn chat(
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: final_message,
+        references: None,
     });
 
     // ── 5. 构建 thinking 参数 ──────────────────
@@ -620,10 +645,12 @@ pub async fn chat(
     record.messages.push(ChatMessage {
         role: "user".to_string(),
         content: user_message.clone(),
+        references: None,
     });
     record.messages.push(ChatMessage {
         role: "assistant".to_string(),
         content: reply.clone(),
+        references: None,
     });
     record.updated_at = now.clone();
 
@@ -685,6 +712,7 @@ pub async fn chat(
         reasoning_content,
         usage,
         session_id,
+        references: None,
     }))
 }
 
@@ -788,6 +816,8 @@ struct RagHit {
     text: String,
     file_path: String,
     distance: f32,
+    page_number: i32,
+    chunk_index: i32,
 }
 
 /// POST /api/chat/rag
@@ -906,6 +936,12 @@ pub async fn chat_rag(
             let dist_col = batch
                 .column_by_name("_distance")
                 .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>());
+            let page_col = batch
+                .column_by_name("page_number")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::Int32Array>());
+            let chunk_col = batch
+                .column_by_name("chunk_index")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::Int32Array>());
 
             if let (Some(texts), Some(paths), Some(dists)) = (text_col, path_col, dist_col) {
                 for i in 0..batch.num_rows() {
@@ -913,6 +949,8 @@ pub async fn chat_rag(
                         text: texts.value(i).to_string(),
                         file_path: paths.value(i).to_string(),
                         distance: dists.value(i),
+                        page_number: page_col.map(|c| c.value(i)).unwrap_or(0),
+                        chunk_index: chunk_col.map(|c| c.value(i)).unwrap_or(0),
                     });
                 }
             }
@@ -927,16 +965,10 @@ pub async fn chat_rag(
     if all_hits.is_empty() {
         info!("[RAG] ❌ 本地向量库未检索到相关内容，将直接提问大模型");
     } else {
-        info!("[RAG] ✅ 本地向量库命中 {} 条相关内容:", all_hits.len());
-        for (i, hit) in all_hits.iter().enumerate() {
-            info!(
-                "[RAG]   #{}: 距离={:.4}, 来源='{}', 内容前80字: {}",
-                i + 1,
-                hit.distance,
-                hit.file_path,
-                hit.text.chars().take(80).collect::<String>()
-            );
-        }
+        // 提取去重的文件名列表
+        let mut hit_files: Vec<&str> = all_hits.iter().map(|h| h.file_path.as_str()).collect();
+        hit_files.dedup();
+        info!("[RAG] ✅ 命中 {} 条，来源文件: {:?}", all_hits.len(), hit_files);
     }
 
     // ── 4. 构建发送给大模型的消息 ──────────────────────
@@ -962,6 +994,7 @@ pub async fn chat_rag(
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: final_message,
+        references: None,
     });
 
     let thinking = match payload.thinking {
@@ -1038,7 +1071,34 @@ pub async fn chat_rag(
 
     info!("[RAG] DeepSeek 回复长度: {} 字符", reply.len());
 
-    // ── 7. 保存会话记录 ──────────────────────
+    // ── 7. 构建引用信息 ──────────────────────
+    let references = if all_hits.is_empty() {
+        None
+    } else {
+        Some(
+            all_hits
+                .iter()
+                .map(|hit| {
+                    // 从 file_path 提取纯文件名 (如 "data/uploads/项目文件/test.pdf" → "test.pdf")
+                    let file_name = Path::new(&hit.file_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&hit.file_path)
+                        .to_string();
+                    ReferenceInfo {
+                        file_name,
+                        file_path: hit.file_path.clone(),
+                        page_number: hit.page_number,
+                        chunk_index: hit.chunk_index,
+                        distance: hit.distance,
+                        snippet: hit.text.chars().take(200).collect(),
+                    }
+                })
+                .collect(),
+        )
+    };
+
+    // ── 8. 保存会话记录 ──────────────────────
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let is_new_session = payload.session_id.is_none();
 
@@ -1070,10 +1130,12 @@ pub async fn chat_rag(
     record.messages.push(ChatMessage {
         role: "user".to_string(),
         content: user_message.clone(),
+        references: None,
     });
     record.messages.push(ChatMessage {
         role: "assistant".to_string(),
         content: reply.clone(),
+        references: references.clone(),
     });
     record.updated_at = now.clone();
 
@@ -1128,5 +1190,6 @@ pub async fn chat_rag(
         reasoning_content,
         usage,
         session_id,
+        references,
     }))
 }
