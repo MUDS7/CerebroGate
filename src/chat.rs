@@ -1,39 +1,19 @@
+use std::path::Path;
 use std::sync::Arc;
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{Json, extract::{Multipart, State}, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::extractor;
 use crate::handler::{ApiResponse, AppState};
 
 // ──────────────────────────────────────
 // 请求 / 响应 数据结构
 // ──────────────────────────────────────
 
-/// 前端发来的对话请求
-#[derive(Debug, Deserialize)]
-pub struct ChatRequest {
-    /// 用户输入的消息
-    pub message: String,
-    /// 历史对话记录（可选），格式与 DeepSeek/OpenAI 一致
-    #[serde(default)]
-    pub history: Vec<ChatMessage>,
-    /// 使用的模型，默认 deepseek-chat
-    /// 可选值: "deepseek-chat"（普通模式）、"deepseek-reasoner"（思考模式）
-    #[serde(default = "default_model")]
-    pub model: String,
-    /// 是否开启思考模式（可选）
-    /// 设为 true 时等同于 {"type": "enabled"}，也可通过 model="deepseek-reasoner" 开启
-    #[serde(default)]
-    pub thinking: Option<bool>,
-    /// 会话 ID（可选），如果不传则创建新会话
-    #[serde(default)]
-    pub session_id: Option<String>,
-}
-
-fn default_model() -> String {
-    "deepseek-chat".to_string()
-}
+// 注：ChatRequest 已废弃，/api/chat 接口现在使用 multipart/form-data 格式
+// 各字段通过 multipart 字段解析: message, history, model, thinking, session_id, files
 
 /// 单条对话消息（注意：多轮对话拼接时不要把 reasoning_content 传入 history）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,12 +260,214 @@ async fn summarize_title(user_message: &str, assistant_reply: &str) -> String {
 // Handlers
 // ──────────────────────────────────────
 
+/// 聊天临时文件目录
+const CHAT_TMP_DIR: &str = "data/chat_tmp";
+
+/// 获取文件扩展名（小写）
+fn get_extension(file_name: &str) -> String {
+    Path::new(file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// 已上传文件的信息（用于提取文本后拼接上下文）
+struct UploadedFile {
+    file_name: String,
+    extracted_text: String,
+}
+
 /// POST /api/chat
+///
+/// 支持 multipart/form-data 格式，字段说明：
+/// - `message`    (必填) 用户消息文本
+/// - `history`    (可选) 历史对话 JSON 数组字符串，格式: [{"role":"user","content":"..."},…]
+/// - `model`      (可选) 模型名，默认 "deepseek-chat"
+/// - `thinking`   (可选) "true" / "false"
+/// - `session_id` (可选) 会话 ID
+/// - `files`      (可选，可多个) 上传的文件，支持 pdf/docx/doc/xlsx/xls/csv/md/txt
 pub async fn chat(
     State(_state): State<Arc<AppState>>,
-    Json(payload): Json<ChatRequest>,
+    mut multipart: Multipart,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ApiResponse>)> {
-    // 1. 读取 API Key
+    // ── 0. 解析 multipart 字段 ──────────────────
+    let mut message: Option<String> = None;
+    let mut history: Vec<ChatMessage> = Vec::new();
+    let mut model = "deepseek-chat".to_string();
+    let mut thinking_flag: Option<bool> = None;
+    let mut session_id_input: Option<String> = None;
+    let mut uploaded_files: Vec<UploadedFile> = Vec::new();
+
+    // 确保临时目录存在
+    let _ = tokio::fs::create_dir_all(CHAT_TMP_DIR).await;
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: format!("解析 multipart 请求失败: {}", e),
+            }),
+        )
+    })? {
+        let name = field.name().unwrap_or("").to_string();
+        let field_file_name = field.file_name().map(|s| s.to_string());
+        let field_content_type = field.content_type().map(|s| s.to_string());
+        info!(
+            "[multipart] 收到字段: name='{}', file_name={:?}, content_type={:?}",
+            name, field_file_name, field_content_type
+        );
+
+        match name.as_str() {
+            "message" => {
+                let text = field.text().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse {
+                            success: false,
+                            message: format!("读取 message 字段失败: {}", e),
+                        }),
+                    )
+                })?;
+                message = Some(text);
+            }
+            "history" => {
+                let text = field.text().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse {
+                            success: false,
+                            message: format!("读取 history 字段失败: {}", e),
+                        }),
+                    )
+                })?;
+                // 尝试解析 JSON 数组
+                if !text.is_empty() {
+                    history = serde_json::from_str(&text).unwrap_or_default();
+                }
+            }
+            "model" => {
+                if let Ok(text) = field.text().await {
+                    if !text.is_empty() {
+                        model = text;
+                    }
+                }
+            }
+            "thinking" => {
+                if let Ok(text) = field.text().await {
+                    thinking_flag = match text.as_str() {
+                        "true" | "1" => Some(true),
+                        "false" | "0" => Some(false),
+                        _ => None,
+                    };
+                }
+            }
+            "session_id" => {
+                if let Ok(text) = field.text().await {
+                    if !text.is_empty() {
+                        session_id_input = Some(text);
+                    }
+                }
+            }
+            "files" | "file" => {
+                // 处理文件上传
+                let file_name = field_file_name
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                let data = field.bytes().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse {
+                            success: false,
+                            message: format!("读取文件 '{}' 数据失败: {}", file_name, e),
+                        }),
+                    )
+                })?;
+
+                info!(
+                    "[文件上传] 收到文件: '{}', 大小: {} 字节, 扩展名: '{}'",
+                    file_name, data.len(), get_extension(&file_name)
+                );
+
+                let extension = get_extension(&file_name);
+
+                // 跳过图片文件（不含可提取文本）
+                if matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+                    info!("跳过图片文件 '{}' (聊天上下文不支持图片)", file_name);
+                    continue;
+                }
+
+                // 写入临时文件
+                let tmp_name = format!("{}_{}", uuid::Uuid::new_v4(), file_name);
+                let tmp_path = format!("{}/{}", CHAT_TMP_DIR, tmp_name);
+                tokio::fs::write(&tmp_path, &data).await.map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse {
+                            success: false,
+                            message: format!("保存临时文件失败: {}", e),
+                        }),
+                    )
+                })?;
+
+                // 提取文本
+                let extracted = extractor::extract_text(&tmp_path, &extension);
+
+                // 清理临时文件
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+
+                match extracted {
+                    Ok(pages) => {
+                        let text: String = pages
+                            .iter()
+                            .map(|p| p.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !text.trim().is_empty() {
+                            info!("文件 '{}' 成功提取文本，长度: {} 字符", file_name, text.len());
+                            uploaded_files.push(UploadedFile {
+                                file_name: file_name.clone(),
+                                extracted_text: text,
+                            });
+                        } else {
+                            warn!("文件 '{}' 未提取到有效文本内容", file_name);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("文件 '{}' 文本提取失败: {}", file_name, e);
+                    }
+                }
+            }
+            _ => {
+                // 忽略未知字段
+            }
+        }
+    }
+
+    // ── 1. 校验必填字段 ──────────────────────
+    let user_message = message.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: "缺少 message 字段".to_string(),
+            }),
+        )
+    })?;
+
+    if user_message.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: "message 不能为空".to_string(),
+            }),
+        ));
+    }
+
+    // ── 2. 读取 API Key ──────────────────────
     let api_key = std::env::var("DEEPSEEK_API_KEY").map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -296,35 +478,53 @@ pub async fn chat(
         )
     })?;
 
-    let user_message = payload.message.clone();
+    // ── 3. 拼接文件上下文到用户消息 ──────────────────
+    let final_message = if uploaded_files.is_empty() {
+        user_message.clone()
+    } else {
+        let mut context_parts = Vec::new();
+        for uf in &uploaded_files {
+            context_parts.push(format!(
+                "【文件: {}】\n{}\n【文件结束】",
+                uf.file_name, uf.extracted_text
+            ));
+        }
+        let file_context = context_parts.join("\n\n");
+        info!("附加 {} 个文件上下文，总长度: {} 字符", uploaded_files.len(), file_context.len());
+        format!(
+            "以下是用户上传的文件内容，请结合文件内容回答用户的问题：\n\n{}\n\n用户问题：{}",
+            file_context, user_message
+        )
+    };
 
-    // 2. 组装消息列表：历史 + 本次用户消息
-    let mut messages = payload.history.clone();
+    // ── 4. 组装消息列表：历史 + 本次用户消息 ──────────
+    let mut messages = history.clone();
     messages.push(ChatMessage {
         role: "user".to_string(),
-        content: payload.message.clone(),
+        content: final_message,
     });
 
-    // 3. 构建 thinking 参数
-    let thinking = match payload.thinking {
+    // ── 5. 构建 thinking 参数 ──────────────────
+    let thinking = match thinking_flag {
         Some(true) => Some(ThinkingParam { kind: "enabled".to_string() }),
         Some(false) => Some(ThinkingParam { kind: "disabled".to_string() }),
-        None => None, // 不传此参数，由 model 名决定
+        None => None,
     };
 
     let body = DeepSeekRequest {
-        model: payload.model.clone(),
+        model: model.clone(),
         messages,
         thinking,
     };
 
     info!(
-        "调用 DeepSeek Chat API (model={})，消息数: {}",
-        payload.model,
-        body.messages.len()
+        "调用 DeepSeek Chat API (model={})，消息数: {}，附件数: {}",
+        model,
+        body.messages.len(),
+        uploaded_files.len()
     );
 
-    // 4. 调用 DeepSeek API
+    // ── 6. 调用 DeepSeek API ──────────────────
     let client = reqwest::Client::new();
     let resp = client
         .post("https://api.deepseek.com/chat/completions")
@@ -342,7 +542,7 @@ pub async fn chat(
             )
         })?;
 
-    // 5. 检查 HTTP 状态码
+    // ── 7. 检查 HTTP 状态码 ──────────────────
     if !resp.status().is_success() {
         let status = resp.status();
         let error_text = resp.text().await.unwrap_or_default();
@@ -355,7 +555,7 @@ pub async fn chat(
         ));
     }
 
-    // 6. 解析响应
+    // ── 8. 解析响应 ──────────────────────────
     let ds_resp: DeepSeekResponse = resp.json().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -388,12 +588,11 @@ pub async fn chat(
         if reasoning_content.is_some() { "（含思维链）" } else { "" }
     );
 
-    // ── 7. 保存会话记录 ───────────────────────
+    // ── 9. 保存会话记录 ───────────────────────
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let is_new_session = payload.session_id.is_none();
+    let is_new_session = session_id_input.is_none();
 
-    let session_id = payload
-        .session_id
+    let session_id = session_id_input
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
@@ -402,7 +601,7 @@ pub async fn chat(
         SessionRecord {
             session_id: session_id.clone(),
             title: "新对话".to_string(),
-            model: payload.model.clone(),
+            model: model.clone(),
             messages: Vec::new(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -411,14 +610,14 @@ pub async fn chat(
         load_session(&session_id).await.unwrap_or_else(|| SessionRecord {
             session_id: session_id.clone(),
             title: "新对话".to_string(),
-            model: payload.model.clone(),
+            model: model.clone(),
             messages: Vec::new(),
             created_at: now.clone(),
             updated_at: now.clone(),
         })
     };
 
-    // 追加用户消息和助手回复
+    // 追加用户消息和助手回复（保存原始用户消息，不含文件上下文）
     record.messages.push(ChatMessage {
         role: "user".to_string(),
         content: user_message.clone(),
@@ -443,7 +642,7 @@ pub async fn chat(
         sessions.push(SessionMeta {
             session_id: session_id.clone(),
             title: "新对话".to_string(),
-            model: payload.model.clone(),
+            model: model.clone(),
             message_count: record.messages.len(),
             created_at: now.clone(),
             updated_at: now,
