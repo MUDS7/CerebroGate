@@ -1,96 +1,70 @@
-use serde::{Deserialize, Serialize};
-use tracing::info;
+use std::sync::{OnceLock, Mutex};
+use fastembed::{TextEmbedding, InitOptionsUserDefined, UserDefinedEmbeddingModel};
 
-/// DeepSeek Embedding API 的向量维度
-pub const EMBEDDING_DIM: i32 = 768;
+/// 我们选用的 BGESmallZHV15 的确是 512 维的
+pub const EMBEDDING_DIM: i32 = 512;
 
-/// DeepSeek Embedding API 端点
-const DEEPSEEK_API_URL: &str = "https://api.deepseek.com/v1/embeddings";
+// 全局唯一的模型实例，赋予 Mutex 处理模型底层并行并发状态
+static EMBEDDING_MODEL: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
 
-/// DeepSeek Embedding 模型名称
-const DEEPSEEK_MODEL: &str = "deepseek-embedding-v2";
+/// 初始化本地模型并在后台加载到内存（只执行一次）
+pub fn init_model() -> &'static Mutex<TextEmbedding> {
+    EMBEDDING_MODEL.get_or_init(|| {
+        tracing::info!("正在装载本地纯离线中文向量模型...");
 
-/// Embedding 请求体（兼容 OpenAI 格式）
-#[derive(Debug, Serialize)]
-struct EmbeddingRequest {
-    model: String,
-    input: Vec<String>,
+        // 获取当前工作目录，并构建离线模型路径
+        let model_dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("data").join("bge-small-zh-v1.5-onnx");
+
+        let read_file = |path: std::path::PathBuf| -> Vec<u8> {
+            std::fs::read(&path).unwrap_or_else(|_| panic!("抱歉，无法读取离线模型相关文件: {:?}", path))
+        };
+
+        let tokenizers = fastembed::TokenizerFiles {
+            tokenizer_file: read_file(model_dir.join("tokenizer.json")),
+            config_file: read_file(model_dir.join("config.json")),
+            special_tokens_map_file: read_file(model_dir.join("special_tokens_map.json")),
+            tokenizer_config_file: read_file(model_dir.join("tokenizer_config.json")),
+        };
+
+        let model_param = UserDefinedEmbeddingModel::new(
+            read_file(model_dir.join("onnx").join("model.onnx")),
+            tokenizers
+        );
+
+        let model = TextEmbedding::try_new_from_user_defined(
+            model_param,
+            InitOptionsUserDefined::default()
+        )
+        .expect("无法加载离线模型文件，请确保执行了下载脚本或模型放置在正确的 data/bge-small-zh-v1.5-onnx 目录下");
+        
+        tracing::info!("⚡ 完全离线本地特征向量引擎编译及挂载就绪！");
+        Mutex::new(model)
+    })
 }
 
-/// Embedding 响应体
-#[derive(Debug, Deserialize)]
-struct EmbeddingResponse {
-    data: Vec<EmbeddingData>,
-}
-
-/// 单条 Embedding 数据
-#[derive(Debug, Deserialize)]
-struct EmbeddingData {
-    embedding: Vec<f32>,
-}
-
-/// 调用 DeepSeek Embedding API，将文本列表转换为向量
-///
-/// # 参数
-/// - `texts`: 待向量化的文本列表
-/// - `api_key`: DeepSeek API Key
-///
-/// # 返回
-/// - 与 texts 一一对应的向量列表
+/// 调用本地 Embedding 向量化引擎
 pub async fn embed_texts(
     texts: &[String],
-    api_key: &str,
+    _api_key: &str, // 保留签名兼容旧代码
 ) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() {
         return Ok(vec![]);
     }
 
-    let client = reqwest::Client::new();
+    // 取得静态生命周期的 Mutex 引用
+    let model_mutex = init_model();
 
-    // DeepSeek API 支持批量输入，但需注意 token 限制
-    // 我们分批处理，每批最多 16 条文本
-    let batch_size = 16;
-    let mut all_embeddings = Vec::new();
+    // 在针对大模型推理计算时，必须放到专门的阻塞线程中进行防止卡死 Tokio 事件循环
+    let texts_clone = texts.to_vec();
+    let embeddings = tokio::task::spawn_blocking(move || {
+        let mut model = model_mutex.lock().map_err(|_| "大模型 Mutex 锁异常崩溃")?;
+        model.embed(texts_clone, None).map_err(|e| format!("{}", e))
+    })
+    .await
+    .map_err(|e| format!("执行线程池崩溃: {:?}", e))?
+    .map_err(|e| format!("模型内部处理发生报错: {:?}", e))?;
 
-    for (batch_idx, batch) in texts.chunks(batch_size).enumerate() {
-        let request = EmbeddingRequest {
-            model: DEEPSEEK_MODEL.to_string(),
-            input: batch.to_vec(),
-        };
-
-        let response = client
-            .post(DEEPSEEK_API_URL)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| format!("调用 DeepSeek API 失败: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!(
-                "DeepSeek API 返回错误 ({}): {}",
-                status, body
-            ));
-        }
-
-        let embedding_response: EmbeddingResponse = response
-            .json()
-            .await
-            .map_err(|e| format!("解析 DeepSeek API 响应失败: {}", e))?;
-
-        for data in embedding_response.data {
-            all_embeddings.push(data.embedding);
-        }
-
-        info!(
-            "Embedding 批次 {} 完成，处理 {} 条文本",
-            batch_idx + 1,
-            batch.len()
-        );
-    }
-
-    Ok(all_embeddings)
+    Ok(embeddings)
 }

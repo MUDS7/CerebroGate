@@ -30,3 +30,5 @@ reqwest = { version = "0.12", features = ["json"] }
 # 工具
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15.7"
+fastembed = "5.13.0"

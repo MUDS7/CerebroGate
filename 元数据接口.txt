@@ -1,0 +1,34 @@
+1.获取属性attr
+post(get_attrs_enso)
+
+2.找到支吊架stru支撑的bran
+query_around_owner_within_radius(stru.refno, true, None, true, &["BRAN"])
+
+3.找到支吊架在墙上的生根点,找到该墙上对应的点的预埋板编号(该点可能没有预埋板，就为空)
+
+4.获取所属专业(SITE)和专业代码(ZONE)
+post(get_refnos_belong_major)
+
+5.查询自定义类型(:SUPP)的name，找到该类型下所有的atta,若atta的name中包含该自定义类型的name，即返回owner(BRAN)的name
+
+6.获取HPOS，TPOS或POSS，POSE的世界坐标
+
+7.获取元件库的attr(refno->catr.attr)
+
+
+8.根据物项编码和字段获取对应的数据
+
+9.获取房间号
+
+10.一直向上查找仪控管道href连接的工艺的bran或者nozz，工艺管道通过专业号来判断，
+    并返回bran上的pipe的name或者nozz的name，nozz不限制专业，两种情况都没有则返回空
+
+11.一直向上查找仪控管道href连接最后一个的bran,然后返回bran的owner pipe的name
+
+12.获取指定向上层级的name，例如 elbo -> zone.name
+
+13.获取arrive和leave点的对应数据，例如 pheight ， pwidth pbor
+
+14.获取children中某个类型的属性
+
+15.找到arrive和leave点的世界坐标

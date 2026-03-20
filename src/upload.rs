@@ -376,18 +376,21 @@ pub async fn upload_file(
 
             if chunk_count > 0 {
                 // 向量化
-                let api_key = std::env::var("DEEPSEEK_API_KEY").map_err(|_| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse {
-                            success: false,
-                            message: "未设置 DEEPSEEK_API_KEY 环境变量".to_string(),
-                        }),
-                    )
-                })?;
+                let api_key = std::env::var("EMBEDDING_API_KEY")
+                    .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
+                    .map_err(|_| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiResponse {
+                                success: false,
+                                message: "未设置 EMBEDDING_API_KEY 环境变量".to_string(),
+                            }),
+                        )
+                    })?;
 
                 let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
                 let embeddings = embed_texts(&texts, &api_key).await.map_err(|e| {
+                    tracing::error!("向量化失败详细错误: {}", e);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ApiResponse {

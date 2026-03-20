@@ -22,6 +22,9 @@ use upload::{init_default_folders, upload_file};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 加载 .env 环境变量
+    dotenvy::dotenv().ok();
+
     // 初始化日志
     tracing_subscriber::fmt::init();
 
