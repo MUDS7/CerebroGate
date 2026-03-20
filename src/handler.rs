@@ -690,3 +690,67 @@ pub async fn get_file_content(
         content_base64,
     }))
 }
+
+/// 删除指定文件请求体
+#[derive(Debug, Deserialize)]
+pub struct DeleteFileRequest {
+    pub folder: String,
+    pub file_name: String,
+}
+
+/// 删除文件（包括所有文件数据与表记录）
+pub async fn delete_file(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DeleteFileRequest>,
+) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
+    if payload.folder.trim().is_empty() || payload.file_name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse { success: false, message: "参数错误: folder 和 file_name 不能为空".to_string() }),
+        ));
+    }
+
+    let folder_name = &payload.folder;
+    let file_name = &payload.file_name;
+    let enc_folder = crate::upload::encode_folder_name(folder_name);
+    let chunks_tbl = format!("files_{}", enc_folder);
+    let meta_tbl = format!("file_meta_{}", enc_folder);
+
+    let table_names = state.db.table_names().execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse { success: false, message: format!("获取表失败: {}", e) }),
+        )
+    })?;
+
+    // 从元数据表删除记录
+    if table_names.contains(&meta_tbl) {
+        if let Ok(table) = state.db.open_table(&meta_tbl).execute().await {
+            let predicate = format!("file_name = '{}'", file_name.replace("'", "''"));
+            if let Err(e) = table.delete(&predicate).await {
+                tracing::error!("从 {} 删除 {} 失败: {}", meta_tbl, file_name, e);
+            }
+        }
+    }
+
+    // 从切片表删除记录
+    let file_path = format!("data/uploads/{}/{}", folder_name, file_name);
+    if table_names.contains(&chunks_tbl) {
+        if let Ok(table) = state.db.open_table(&chunks_tbl).execute().await {
+            let predicate = format!("file_path = '{}'", file_path.replace("'", "''"));
+            if let Err(e) = table.delete(&predicate).await {
+                tracing::error!("从 {} 删除切片失败: {}", chunks_tbl, e);
+            }
+        }
+    }
+
+    // 删除本地物理文件
+    let _ = tokio::fs::remove_file(&file_path).await;
+
+    info!("文件 '{}/{}' 删除操作完成", folder_name, file_name);
+
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("文件 '{}' 已成功删除", file_name),
+    }))
+}

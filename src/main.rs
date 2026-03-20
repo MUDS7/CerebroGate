@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 use lancedb::connect;
@@ -17,7 +18,7 @@ use tracing::info;
 
 use handler::{
     AppState, add_item, create_folder, delete_folder, get_file_content, get_folder_files, get_folders,
-    health_check, init_table, rename_folder, search,
+    health_check, init_table, rename_folder, search, delete_file,
 };
 use upload::{init_default_folders, upload_file};
 use chat::{chat, chat_rag, get_sessions, get_session_detail, delete_session};
@@ -55,11 +56,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/folders/delete", post(delete_folder))
         .route("/api/folders/files", post(get_folder_files))
         .route("/api/folders/files/content", post(get_file_content))
+        .route("/api/folders/files/delete", post(delete_file))
         .route("/api/chat", post(chat))
         .route("/api/chat/rag", post(chat_rag))
         .route("/api/chat/sessions", get(get_sessions))
         .route("/api/chat/session", post(get_session_detail))
         .route("/api/chat/session/delete", post(delete_session))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB
         .layer(CorsLayer::permissive())
         .with_state(state);
 
