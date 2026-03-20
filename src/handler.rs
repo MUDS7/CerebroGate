@@ -312,3 +312,159 @@ pub async fn get_folders(
 
     Ok(Json(folders))
 }
+
+/// 创建文件夹请求体
+#[derive(Debug, Deserialize)]
+pub struct CreateFolderRequest {
+    pub name: String,
+}
+
+/// 创建一个新的文件夹
+pub async fn create_folder(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CreateFolderRequest>,
+) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
+    if payload.name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: "文件夹名称不能为空".to_string(),
+            }),
+        ));
+    }
+
+    crate::upload::create_folder_tables(&state.db, &payload.name).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("创建文件夹失败: {}", e),
+            }),
+        )
+    })?;
+
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("文件夹 '{}' 创建成功", payload.name),
+    }))
+}
+
+/// 删除文件夹请求体
+#[derive(Debug, Deserialize)]
+pub struct DeleteFolderRequest {
+    pub name: String,
+}
+
+/// 重命名文件夹请求体
+#[derive(Debug, Deserialize)]
+pub struct RenameFolderRequest {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// 删除文件夹（包括所有文件数据与表）
+pub async fn delete_folder(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DeleteFolderRequest>,
+) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
+    if payload.name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse { success: false, message: "参数错误: name 不能为空".to_string() }),
+        ));
+    }
+
+    let folder_name = &payload.name;
+    let enc_folder = crate::upload::encode_folder_name(folder_name);
+    let chunks_tbl = format!("files_{}", enc_folder);
+    let meta_tbl = format!("file_meta_{}", enc_folder);
+
+    // 删除数据库中的表
+    let _ = state.db.drop_table(&chunks_tbl).await;
+    let _ = state.db.drop_table(&meta_tbl).await;
+
+    info!("表 {}, {} 已被删除 (如存在)", chunks_tbl, meta_tbl);
+
+    // 删除本地物理文件夹
+    let upload_dir = format!("data/uploads/{}", folder_name);
+    let _ = tokio::fs::remove_dir_all(&upload_dir).await;
+
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("文件夹 '{}' 及包含的所有文件已成功删除", folder_name),
+    }))
+}
+
+/// 重命名文件夹
+pub async fn rename_folder(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RenameFolderRequest>,
+) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
+    if payload.old_name.trim().is_empty() || payload.new_name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse { success: false, message: "参数错误: 文件夹名不能为空".to_string() }),
+        ));
+    }
+
+    let old_name = &payload.old_name;
+    let new_name = &payload.new_name;
+
+    let table_names = state.db.table_names().execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse { success: false, message: format!("获取表失败: {}", e) }),
+        )
+    })?;
+
+    let old_enc = crate::upload::encode_folder_name(old_name);
+    let new_enc = crate::upload::encode_folder_name(new_name);
+
+    let old_chunks = format!("files_{}", old_enc);
+    let old_meta = format!("file_meta_{}", old_enc);
+    let new_chunks = format!("files_{}", new_enc);
+    let new_meta = format!("file_meta_{}", new_enc);
+
+    // 检查新的名字是否冲突
+    if table_names.contains(&new_chunks) || table_names.contains(&new_meta) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse { success: false, message: "目标文件夹名已存在".to_string() }),
+        ));
+    }
+
+    // 重命名表 (LanceDB OSS 暂不支持 rename_table()，改用物理重命名目录)
+    let db_path = "./.lancedb";
+    if table_names.contains(&old_chunks) {
+        let old_dir = format!("{}/{}.lance", db_path, old_chunks);
+        let new_dir = format!("{}/{}.lance", db_path, new_chunks);
+        if let Err(e) = tokio::fs::rename(&old_dir, &new_dir).await {
+            tracing::error!("重命名表文件失败 {}: {}", old_dir, e);
+        }
+    }
+    if table_names.contains(&old_meta) {
+        let old_dir = format!("{}/{}.lance", db_path, old_meta);
+        let new_dir = format!("{}/{}.lance", db_path, new_meta);
+        if let Err(e) = tokio::fs::rename(&old_dir, &new_dir).await {
+            tracing::error!("重命名表文件失败 {}: {}", old_dir, e);
+        }
+    }
+
+    // 重命名本地文件夹
+    let old_dir = format!("data/uploads/{}", old_name);
+    let new_dir = format!("data/uploads/{}", new_name);
+
+    if tokio::fs::try_exists(&old_dir).await.unwrap_or(false) {
+        let _ = tokio::fs::rename(&old_dir, &new_dir).await;
+    } else {
+        let _ = tokio::fs::create_dir_all(&new_dir).await;
+    }
+
+    info!("文件夹 '{}' 重命名为 '{}'", old_name, new_name);
+
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("文件夹 '{}' 已重命名为 '{}'", old_name, new_name),
+    }))
+}

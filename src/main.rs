@@ -14,7 +14,10 @@ use lancedb::connect;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use handler::{AppState, add_item, get_folders, health_check, init_table, search};
+use handler::{
+    AppState, add_item, create_folder, delete_folder, get_folders, health_check, init_table,
+    rename_folder, search,
+};
 use upload::{init_default_folders, upload_file};
 
 #[tokio::main]
@@ -42,7 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/items", post(add_item))
         .route("/api/search", post(search))
         .route("/api/upload", post(upload_file))
-        .route("/api/folders", get(get_folders))
+        .route("/api/folders", get(get_folders).post(create_folder))
+        .route("/api/folders/rename", post(rename_folder))
+        .route("/api/folders/delete", post(delete_folder))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

@@ -128,6 +128,31 @@ pub async fn init_default_folders(db: &lancedb::Connection) -> Result<(), Box<dy
     Ok(())
 }
 
+/// 创建文件夹（对应的表及本地目录）
+pub async fn create_folder_tables(db: &lancedb::Connection, folder: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let table_names = db.table_names().execute().await?;
+    let enc_folder = encode_folder_name(folder);
+    let chunks_table_name = format!("files_{}", enc_folder);
+    let meta_table_name = format!("file_meta_{}", enc_folder);
+
+    if !table_names.contains(&chunks_table_name) {
+        let batches = RecordBatchIterator::new(vec![], make_chunks_schema());
+        db.create_table(&chunks_table_name, Box::new(batches)).execute().await?;
+        info!("基础表 '{}' 创建成功", chunks_table_name);
+    }
+
+    if !table_names.contains(&meta_table_name) {
+        let batches = RecordBatchIterator::new(vec![], make_meta_schema());
+        db.create_table(&meta_table_name, Box::new(batches)).execute().await?;
+        info!("基础表 '{}' 创建成功", meta_table_name);
+    }
+
+    let upload_dir = format!("data/uploads/{}", folder);
+    tokio::fs::create_dir_all(&upload_dir).await?;
+
+    Ok(())
+}
+
 /// 文件夹名称编码（转为十六进制以符合 LanceDB 表名只允许字母数字下划线的限制）
 pub fn encode_folder_name(folder: &str) -> String {
     folder.bytes().map(|b| format!("{:02x}", b)).collect::<String>()
