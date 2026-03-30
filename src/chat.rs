@@ -810,7 +810,7 @@ fn rag_default_model() -> String {
 }
 
 fn rag_default_top_k() -> usize {
-    5
+    10
 }
 
 /// 向量搜索命中的片段

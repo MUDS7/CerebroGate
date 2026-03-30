@@ -203,8 +203,8 @@ pub async fn upload_file(
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
     let mut folder: Option<String> = None;
-    let mut chunk_size: usize = 500;
-    let mut chunk_overlap: usize = 50;
+    let mut chunk_size: usize = 1500;
+    let mut chunk_overlap: usize = 300;
 
     // 解析 multipart 字段
     while let Some(field) = multipart.next_field().await.map_err(|e| {

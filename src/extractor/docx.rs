@@ -45,14 +45,35 @@ fn extract_text_from_xml(xml: &str) -> String {
     let mut reader = Reader::from_str(xml);
     let mut text = String::new();
     let mut in_w_t = false;
+    let mut tc_depth = 0;
     let mut buf = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+            Ok(Event::Start(ref e)) => {
                 let local_name = e.local_name();
                 if local_name.as_ref() == b"t" {
                     in_w_t = true;
+                } else if local_name.as_ref() == b"tc" {
+                    tc_depth += 1;
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                let local_name = e.local_name();
+                if local_name.as_ref() == b"tab" {
+                    text.push('\t');
+                } else if local_name.as_ref() == b"br" {
+                    text.push('\n');
+                } else if local_name.as_ref() == b"tc" {
+                    text.push('\t');
+                } else if local_name.as_ref() == b"tr" {
+                    text.push('\n');
+                } else if local_name.as_ref() == b"p" {
+                    if tc_depth > 0 {
+                        text.push(' ');
+                    } else {
+                        text.push('\n');
+                    }
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -60,7 +81,17 @@ fn extract_text_from_xml(xml: &str) -> String {
                 if local_name.as_ref() == b"t" {
                     in_w_t = false;
                 } else if local_name.as_ref() == b"p" {
-                    // 段落结束，添加换行
+                    if tc_depth > 0 {
+                        text.push(' ');
+                    } else {
+                        text.push('\n');
+                    }
+                } else if local_name.as_ref() == b"tc" {
+                    if tc_depth > 0 {
+                        tc_depth -= 1;
+                    }
+                    text.push('\t');
+                } else if local_name.as_ref() == b"tr" {
                     text.push('\n');
                 }
             }

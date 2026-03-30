@@ -627,6 +627,7 @@ pub async fn get_folder_files(
 pub struct GetFileContentRequest {
     pub folder: String,
     pub file_name: String,
+    pub file_path: Option<String>,
 }
 
 /// 文件内容响应
@@ -656,7 +657,15 @@ pub async fn get_file_content(
         ));
     }
 
-    let file_path = format!("data/uploads/{}/{}", folder, file_name);
+    let file_path = if let Some(path) = payload.file_path {
+        if path.trim().is_empty() {
+            format!("data/uploads/{}/{}", folder, file_name)
+        } else {
+            path
+        }
+    } else {
+        format!("data/uploads/{}/{}", folder, file_name)
+    };
 
     // 读取文件
     let data = tokio::fs::read(&file_path).await.map_err(|e| {
