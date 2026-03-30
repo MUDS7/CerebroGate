@@ -800,6 +800,9 @@ pub struct RagChatRequest {
     /// 向量搜索返回的最大结果数，默认 5
     #[serde(default = "rag_default_top_k")]
     pub top_k: usize,
+    /// 限定检索的文件夹名称列表（可选），不传或传空数组则搜索所有文件夹
+    #[serde(default)]
+    pub folder: Option<Vec<String>>,
 }
 
 fn rag_default_model() -> String {
@@ -866,7 +869,7 @@ pub async fn chat_rag(
 
     info!("[RAG] 用户问题向量化完成，维度: {}", query_vector.len());
 
-    // ── 2. 遍历所有 files_* 表进行向量搜索 ──────────────
+    // ── 2. 确定需要搜索的 files_* 表 ──────────────
     let table_names = state.db.table_names().execute().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -877,17 +880,45 @@ pub async fn chat_rag(
         )
     })?;
 
-    let files_tables: Vec<&String> = table_names
-        .iter()
-        .filter(|n| n.starts_with("files_"))
-        .collect();
+    let files_tables: Vec<String> = match &payload.folder {
+        Some(folders) if !folders.is_empty() => {
+            // 指定了文件夹列表，只搜索这些文件夹对应的表
+            let mut tables = Vec::new();
+            for folder in folders {
+                let enc_folder = crate::upload::encode_folder_name(folder);
+                let target_table = format!("files_{}", enc_folder);
+                if table_names.contains(&target_table) {
+                    tables.push(target_table);
+                } else {
+                    info!("[RAG] 指定的文件夹 '{}' 对应的表不存在，已跳过", folder);
+                }
+            }
+            tables
+        }
+        _ => {
+            // 未指定文件夹，搜索所有 files_* 表
+            table_names
+                .iter()
+                .filter(|n| n.starts_with("files_"))
+                .cloned()
+                .collect()
+        }
+    };
 
-    info!("[RAG] 检索 {} 个文档表: {:?}", files_tables.len(), files_tables);
+    info!(
+        "[RAG] 检索 {} 个文档表: {:?}{}",
+        files_tables.len(),
+        files_tables,
+        payload.folder.as_ref()
+            .filter(|f| !f.is_empty())
+            .map(|f| format!(" (限定文件夹: {:?})", f))
+            .unwrap_or_default()
+    );
 
     let mut all_hits: Vec<RagHit> = Vec::new();
 
     for table_name in &files_tables {
-        let table = match state.db.open_table(table_name.as_str()).execute().await {
+        let table = match state.db.open_table(table_name).execute().await {
             Ok(t) => t,
             Err(e) => {
                 warn!("[RAG] 打开表 '{}' 失败: {}", table_name, e);
