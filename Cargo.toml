@@ -2,6 +2,7 @@
 name = "cerebro_gate"
 version = "0.1.0"
 edition = "2024"
+default-run = "cerebro_gate"
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
@@ -23,6 +24,12 @@ calamine = "0.26"
 csv = "1"
 zip = "2"
 quick-xml = "0.37"
+pdfium-render = "0.8.23"
+ocrs = "0.12.2"
+image = "0.25"
+rten = "0.24"
+rten-tensor = "0.24"
+rten-imageproc = "0.24"
 
 # HTTP 客户端（调用 Embedding API）
 reqwest = { version = "0.12", features = ["json"] }
