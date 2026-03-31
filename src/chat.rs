@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use crate::embedding;
 use crate::extractor;
 use crate::handler::{ApiResponse, AppState};
+use crate::sensitive_service::{get_all_sensitive_words, process_sensitive_words};
 
 // ──────────────────────────────────────
 // 请求 / 响应 数据结构
@@ -316,7 +317,7 @@ struct UploadedFile {
 /// - `session_id` (可选) 会话 ID
 /// - `files`      (可选，可多个) 上传的文件，支持 pdf/docx/doc/xlsx/xls/csv/md/txt
 pub async fn chat(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ApiResponse>)> {
     // ── 0. 解析 multipart 字段 ──────────────────
@@ -479,6 +480,10 @@ pub async fn chat(
             }),
         )
     })?;
+
+    // ── 1.1 处理敏感词 ──────────────────────
+    let sensitive_words = get_all_sensitive_words(&state).await;
+    let user_message = process_sensitive_words(&user_message, &sensitive_words);
 
     if user_message.trim().is_empty() {
         return Err((
@@ -840,7 +845,9 @@ pub async fn chat_rag(
         )
     })?;
 
-    let user_message = payload.message.clone();
+    // ── 0. 处理敏感词 ──────────────────────
+    let sensitive_words = get_all_sensitive_words(&state).await;
+    let user_message = process_sensitive_words(&payload.message, &sensitive_words);
     info!("[RAG] 收到用户问题: {}", user_message.chars().take(100).collect::<String>());
 
     // ── 1. 将用户问题本地向量化 ──────────────────────

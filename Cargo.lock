@@ -1228,6 +1228,7 @@ dependencies = [
  "pdf-extract",
  "pdfium-render",
  "quick-xml 0.37.5",
+ "regex",
  "reqwest",
  "rten",
  "rten-imageproc",

@@ -82,7 +82,7 @@ fn extract_with_ocr(file_path: &str) -> Result<Vec<ExtractedText>, String> {
     for (i, page) in doc.pages().iter().enumerate() {
         // Render at a high resolution (2000px width)
         let render_config = pdfium_render::prelude::PdfRenderConfig::new().set_target_width(2000);
-        let mut bitmap = page.render_with_config(&render_config).map_err(|e| format!("Render page fail: {:?}", e))?;
+        let bitmap = page.render_with_config(&render_config).map_err(|e| format!("Render page fail: {:?}", e))?;
         
         let dynamic_img = bitmap.as_image(); 
         let rgb_img = dynamic_img.into_rgb8();

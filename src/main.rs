@@ -5,6 +5,7 @@ mod embedding;
 mod upload;
 mod chat;
 mod sensitive;
+mod sensitive_service;
 
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ use handler::{
 };
 use upload::{init_default_folders, upload_file};
 use chat::{chat, chat_rag, get_sessions, get_session_detail, delete_session};
-use sensitive::{init_sensitive_table, list_sensitive_words, add_sensitive_word};
+use sensitive::{init_sensitive_table, list_sensitive_words, add_sensitive_word, update_sensitive_word};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/chat/session/delete", post(delete_session))
         .route("/api/sensitive/list", get(list_sensitive_words))
         .route("/api/sensitive/create", post(add_sensitive_word))
+        .route("/api/sensitive/update", post(update_sensitive_word))
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB
         .layer(CorsLayer::permissive())
         .with_state(state);
