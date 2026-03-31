@@ -363,3 +363,97 @@ pub async fn update_sensitive_word(
         message: "敏感词更新成功".to_string(),
     }))
 }
+
+/// 删除敏感词请求体
+#[derive(Debug, Deserialize)]
+pub struct DeleteSensitiveWordRequest {
+    pub word: String,
+}
+
+/// 删除敏感词
+pub async fn delete_sensitive_word(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DeleteSensitiveWordRequest>,
+) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
+    if payload.word.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: "敏感词内容不能为空".to_string(),
+            }),
+        ));
+    }
+
+    let table = state.db.open_table(SENSITIVE_WORDS_TABLE).execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("打开敏感词表失败: {}", e),
+            }),
+        )
+    })?;
+
+    let filter = format!("word = '{}'", payload.word.replace("'", "''"));
+    let results = table.query().only_if(filter.as_str()).execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("查询敏感词失败: {}", e),
+            }),
+        )
+    })?;
+
+    let batches: Vec<RecordBatch> = results.try_collect().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("收集查询结果失败: {}", e),
+            }),
+        )
+    })?;
+
+    let mut found = false;
+    for batch in &batches {
+        let word_col = batch.column_by_name("word").and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        if let Some(w) = word_col {
+            for i in 0..batch.num_rows() {
+                if w.value(i) == payload.word {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if found { break; }
+    }
+
+    if !found {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse {
+                success: false,
+                message: format!("未找到敏感词: {}", payload.word),
+            }),
+        ));
+    }
+
+    table.delete(&filter).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("删除敏感词失败: {}", e),
+            }),
+        )
+    })?;
+
+    info!("成功删除敏感词: {}", payload.word);
+
+    Ok(Json(ApiResponse {
+        success: true,
+        message: "敏感词删除成功".to_string(),
+    }))
+}
