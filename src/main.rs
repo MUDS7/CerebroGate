@@ -4,6 +4,7 @@ mod chunker;
 mod embedding;
 mod upload;
 mod chat;
+mod sensitive;
 
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ use handler::{
 };
 use upload::{init_default_folders, upload_file};
 use chat::{chat, chat_rag, get_sessions, get_session_detail, delete_session};
+use sensitive::{init_sensitive_table, list_sensitive_words, add_sensitive_word};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,6 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化默认文件夹（项目文件、其他文件）
     init_default_folders(&db).await?;
 
+    // 初始化敏感词表
+    init_sensitive_table(&db).await?;
+
     let state = Arc::new(AppState { db });
 
     // 构建路由
@@ -62,6 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/chat/sessions", get(get_sessions))
         .route("/api/chat/session", post(get_session_detail))
         .route("/api/chat/session/delete", post(delete_session))
+        .route("/api/sensitive/list", get(list_sensitive_words))
+        .route("/api/sensitive/create", post(add_sensitive_word))
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB
         .layer(CorsLayer::permissive())
         .with_state(state);
