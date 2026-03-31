@@ -507,7 +507,7 @@ pub async fn chat(
     })?;
 
     // ── 3. 拼接文件上下文到用户消息 ──────────────────
-    let final_message = if uploaded_files.is_empty() {
+    let mut final_message = if uploaded_files.is_empty() {
         user_message.clone()
     } else {
         let mut context_parts = Vec::new();
@@ -524,6 +524,9 @@ pub async fn chat(
             file_context, user_message
         )
     };
+
+    // ── 3.1 对最终发送的消息（包含文件提取文本）再次进行敏感词脱敏 ──────────
+    final_message = process_sensitive_words(&final_message, &sensitive_words);
 
     // ── 4. 组装消息列表：历史 + 本次用户消息 ──────────
     let mut messages = history.clone();
@@ -596,10 +599,12 @@ pub async fn chat(
     })?;
 
     let first_choice = ds_resp.choices.first();
-
-    let reply = first_choice
+    let mut reply = first_choice
         .and_then(|c| c.message.content.clone())
         .unwrap_or_default();
+
+    // ── 8.1 对大模型的回答进行最后一道敏感词过滤 ──────────
+    reply = process_sensitive_words(&reply, &sensitive_words);
 
     let reasoning_content = first_choice
         .and_then(|c| c.message.reasoning_content.clone())
@@ -1010,7 +1015,7 @@ pub async fn chat_rag(
     }
 
     // ── 4. 构建发送给大模型的消息 ──────────────────────
-    let final_message = if all_hits.is_empty() {
+    let mut final_message = if all_hits.is_empty() {
         user_message.clone()
     } else {
         let mut context_parts = Vec::new();
@@ -1020,7 +1025,11 @@ pub async fn chat_rag(
                 hit.file_path, hit.text
             ));
         }
-        let rag_context = context_parts.join("\n\n");
+        let mut rag_context = context_parts.join("\n\n");
+        
+        // ── 4.1 对检索出的知识库片段进行敏感词脱敏 ──────────
+        rag_context = process_sensitive_words(&rag_context, &sensitive_words);
+        
         format!(
             "以下是从知识库中检索到的与用户问题相关的参考内容：\n\n{}\n\n请结合以上参考内容回答用户的问题。如果参考内容与问题无关，请忽略参考内容直接回答。\n\n用户问题：{}",
             rag_context, user_message
@@ -1095,9 +1104,12 @@ pub async fn chat_rag(
     })?;
 
     let first_choice = ds_resp.choices.first();
-    let reply = first_choice
+    let mut reply = first_choice
         .and_then(|c| c.message.content.clone())
         .unwrap_or_default();
+
+    // ── 6.1 对大模型的回答进行最后一道敏感词过滤 ──────────
+    reply = process_sensitive_words(&reply, &sensitive_words);
     let reasoning_content = first_choice
         .and_then(|c| c.message.reasoning_content.clone())
         .filter(|s| !s.is_empty());
