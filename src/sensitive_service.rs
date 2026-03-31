@@ -1,4 +1,4 @@
-use crate::handler::AppState;
+﻿use crate::handler::AppState;
 use crate::sensitive::{SENSITIVE_WORDS_TABLE, SensitiveWord};
 use arrow_array::{RecordBatch, StringArray};
 use futures::TryStreamExt;
@@ -56,26 +56,55 @@ pub async fn get_all_sensitive_words(state: &AppState) -> Vec<SensitiveWord> {
 pub fn process_sensitive_words(content: &str, sensitive_words: &[SensitiveWord]) -> String {
     let mut result = content.to_string();
     for sw in sensitive_words {
-        let replacement = match sw.replace_strategy.as_str() {
+        let strategy_raw = sw.match_strategy.trim();
+        let strategy = strategy_raw.to_lowercase();
+        let replacement_for = |matched: &str| match sw.replace_strategy.as_str() {
             "remove" => "".to_string(),
-            "mask" => "*".repeat(sw.word.chars().count()),
-            custom => custom.to_string(), // 如果是自定义文本则直接替换
+            "mask" => "*".repeat(matched.chars().count()),
+            custom => custom.to_string(),
         };
 
-        match sw.match_strategy.as_str() {
-            "exact" => {
+        if strategy == "exact" {
+            if result.contains(&sw.word) {
+                let replacement = replacement_for(&sw.word);
                 result = result.replace(&sw.word, &replacement);
             }
-            "fuzzy" => {
-                // fuzzy 策略视为正则表达式匹配
-                if let Ok(re) = Regex::new(&sw.word) {
-                    result = re.replace_all(&result, replacement.as_str()).into_owned();
-                } else {
-                    warn!("敏感词正则解析失败: {}", sw.word);
-                }
+            continue;
+        }
+
+        if matches!(strategy.as_str(), "fuzzy" | "regex" | "re") {
+            warn!(
+                "敏感词配置不符合约定: match_strategy='{}'，请直接填写正则到 match_strategy 字段",
+                sw.match_strategy
+            );
+            continue;
+        }
+
+        // match_strategy 直接作为正则匹配
+        let mut patterns = vec![strategy_raw.to_string()];
+        if strategy_raw.contains("\\\\") {
+            let normalized = strategy_raw.replace("\\\\", "\\");
+            if normalized != strategy_raw {
+                patterns.push(normalized);
             }
-            _ => {
-                // 未知策略暂不处理
+        }
+
+        for pattern in patterns {
+            match Regex::new(&pattern) {
+                Ok(re) => {
+                    if re.is_match(&result) {
+                        result = re
+                            .replace_all(&result, |caps: &regex::Captures| {
+                                let m = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                                replacement_for(m)
+                            })
+                            .into_owned();
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("敏感词正则解析失败: '{}', 错误: {}", pattern, e);
+                }
             }
         }
     }

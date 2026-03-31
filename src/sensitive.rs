@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use axum::{
@@ -11,6 +11,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use crate::handler::{ApiResponse, AppState};
+use regex::Regex;
 
 /// 敏感词结构
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -30,6 +31,52 @@ pub struct CreateSensitiveWordRequest {
 }
 
 pub const SENSITIVE_WORDS_TABLE: &str = "sensitive_words";
+
+fn validate_sensitive_word(word: &str, match_strategy: &str) -> Result<(), String> {
+    let word = word.trim();
+    if word.is_empty() {
+        return Err("敏感词内容不能为空".to_string());
+    }
+
+    let strategy = match_strategy.trim();
+    if strategy.is_empty() {
+        return Err("match_strategy 不能为空".to_string());
+    }
+
+    let strategy_lower = strategy.to_lowercase();
+    if strategy_lower == "exact" {
+        return Ok(());
+    }
+
+    if matches!(strategy_lower.as_str(), "fuzzy" | "regex" | "re") {
+        return Err("match_strategy 不再支持关键字 fuzzy/regex/re，请直接填写正则到 match_strategy 字段".to_string());
+    }
+
+    // match_strategy 直接作为正则校验
+    let mut patterns = vec![strategy.to_string()];
+    if strategy.contains("\\\\") {
+        let normalized = strategy.replace("\\\\", "\\");
+        if normalized != strategy {
+            patterns.push(normalized);
+        }
+    }
+    let mut ok = false;
+    let mut last_err: Option<String> = None;
+    for p in patterns {
+        match Regex::new(&p) {
+            Ok(_) => {
+                ok = true;
+                break;
+            }
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+    if !ok {
+        return Err(format!("正则表达式无效: {}", last_err.unwrap_or_default()));
+    }
+
+    Ok(())
+}
 
 fn make_sensitive_words_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -115,6 +162,15 @@ pub async fn add_sensitive_word(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateSensitiveWordRequest>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
+    if let Err(msg) = validate_sensitive_word(&payload.word, &payload.match_strategy) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: msg,
+            }),
+        ));
+    }
     let table = state.db.open_table(SENSITIVE_WORDS_TABLE).execute().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -183,6 +239,15 @@ pub async fn update_sensitive_word(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UpdateSensitiveWordRequest>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
+    if let Err(msg) = validate_sensitive_word(&payload.new_word, &payload.match_strategy) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: msg,
+            }),
+        ));
+    }
     let table = state.db.open_table(SENSITIVE_WORDS_TABLE).execute().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
