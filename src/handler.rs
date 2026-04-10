@@ -763,3 +763,181 @@ pub async fn delete_file(
         message: format!("文件 '{}' 已成功删除", file_name),
     }))
 }
+
+/// 文本搜索请求体
+#[derive(Debug, Deserialize)]
+pub struct SearchTextRequest {
+    pub query: String,
+    pub folder: Option<Vec<String>>,
+    pub limit: Option<usize>,
+}
+
+/// 文本搜索响应命中的单个结果
+#[derive(Debug, Serialize)]
+pub struct SearchTextHit {
+    pub file_name: String,
+    pub file_path: String,
+    pub distance: f32,
+    pub snippet: String,
+}
+
+/// 文本搜索响应
+#[derive(Debug, Serialize)]
+pub struct SearchTextResponse {
+    pub success: bool,
+    pub matches: Vec<SearchTextHit>,
+}
+
+/// 提供基于自然语言查询的直接检索服务（不需要通过大语言模型）
+pub async fn search_text(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SearchTextRequest>,
+) -> Result<Json<SearchTextResponse>, (StatusCode, Json<ApiResponse>)> {
+    if payload.query.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse { success: false, message: "参数错误: query 不能为空".to_string() }),
+        ));
+    }
+
+    let top_k = payload.limit.unwrap_or(10);
+    
+    // 强制传一个空的 API Key（如果你的 embedding 也完全走本地的话）
+    let api_key = "local_mode".to_string();
+
+    // ── 1. 将用户问题本地向量化
+    let query_texts = vec![payload.query.clone()];
+    let query_vectors = crate::embedding::embed_texts(&query_texts, &api_key)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse {
+                    success: false,
+                    message: format!("用户问题向量化失败: {}", e),
+                }),
+            )
+        })?;
+
+    let query_vector = query_vectors.into_iter().next().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: "向量化结果为空".to_string(),
+            }),
+        )
+    })?;
+
+    // ── 2. 遍历指定或者全部的表
+    let table_names = state.db.table_names().execute().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("获取表列表失败: {}", e),
+            }),
+        )
+    })?;
+
+    let files_tables: Vec<String> = match &payload.folder {
+        Some(folders) if !folders.is_empty() => {
+            let mut tables = Vec::new();
+            for folder in folders {
+                let enc_folder = crate::upload::encode_folder_name(folder);
+                let target_table = format!("files_{}", enc_folder);
+                if table_names.contains(&target_table) {
+                    tables.push(target_table);
+                }
+            }
+            tables
+        }
+        _ => table_names.into_iter().filter(|n| n.starts_with("files_")).collect(),
+    };
+
+    let mut all_hits: Vec<SearchTextHit> = Vec::new();
+
+    for table_name in &files_tables {
+        let table = match state.db.open_table(table_name).execute().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("打开表 '{}' 失败: {}", table_name, e);
+                continue;
+            }
+        };
+
+        // 检查是否有数据，如果没数据跳过 vector_search 以免报错
+        let row_count = table.count_rows(None).await.unwrap_or(0);
+        if row_count == 0 {
+            continue;
+        }
+
+        let results = match table.vector_search(query_vector.clone()) {
+            Ok(query) => match query.limit(top_k).execute().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::warn!("表 '{}' 向量搜索执行失败: {}", table_name, e);
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::warn!("创建搜索查询失败: {}", e);
+                continue;
+            }
+        };
+
+        let batches: Vec<RecordBatch> = match results.try_collect().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("收集搜索结果失败: {}", e);
+                continue;
+            }
+        };
+
+        for batch in &batches {
+            let text_col = batch
+                .column_by_name("text")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let path_col = batch
+                .column_by_name("file_path")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let dist_col = batch
+                .column_by_name("_distance")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>());
+
+            if let (Some(texts), Some(paths), Some(dists)) = (text_col, path_col, dist_col) {
+                for i in 0..batch.num_rows() {
+                    let file_path = paths.value(i).to_string();
+                    let file_name = std::path::Path::new(&file_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&file_path)
+                        .to_string();
+
+                    // 截取前200词作为摘要预览
+                    let snippet = texts.value(i).chars().take(200).collect();
+
+                    all_hits.push(SearchTextHit {
+                        file_name,
+                        file_path,
+                        distance: dists.value(i),
+                        snippet,
+                    });
+                }
+            }
+        }
+    }
+
+    // 针对查出的所有结果汇总再次跨表排序取 top_k
+    all_hits.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+    all_hits.truncate(top_k);
+    
+    // 如果想要只保留每个文件只出第一条匹配的策略，可以借助 dedup_by 或者 hashset 进一步做文件去重
+    let mut seen = std::collections::HashSet::new();
+    all_hits.retain(|hit| seen.insert(hit.file_path.clone()));
+
+    Ok(Json(SearchTextResponse {
+        success: true,
+        matches: all_hits,
+    }))
+}
