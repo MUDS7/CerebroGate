@@ -30,6 +30,7 @@ image = "0.25"
 rten = "0.24"
 rten-tensor = "0.24"
 rten-imageproc = "0.24"
+litchi = "0.0.1"
 
 # HTTP 客户端（调用 Embedding API）
 reqwest = { version = "0.12", features = ["json"] }
@@ -42,3 +43,4 @@ fastembed = "5.13.0"
 urlencoding = "2"
 base64 = "0.22"
 regex = "1.12.3"
+walkdir = "2.5.0"
